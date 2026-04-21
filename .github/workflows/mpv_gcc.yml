@@ -1,4 +1,4 @@
-name: mpv clang
+name: mpv gcc
 defaults:
   run:
     shell: bash
@@ -30,11 +30,10 @@ jobs:
   build_mpv:
     name: Building mpv
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
-        bit: [i686, x86_64, x86_64_v3, aarch64]
+        bit: [x86_64]
     env:
       BIT: ${{ matrix.bit }}
     container:
@@ -50,10 +49,8 @@ jobs:
             echo "arch=x86_64" >> $GITHUB_ENV
           elif [[ $BIT == "x86_64_v3" ]]; then
             echo "arch=x86_64" >> $GITHUB_ENV
+            echo "gcc_arch=-DGCC_ARCH=x86-64-v3" >> $GITHUB_ENV
             echo "x86_64_level=-v3" >> $GITHUB_ENV
-            echo "x86_64_v3_ARCH=-DGCC_ARCH=x86-64-v3" >> $GITHUB_ENV
-          elif [[ $BIT == "aarch64" ]]; then
-            echo "arch=aarch64" >> $GITHUB_ENV
           fi
 
       - name: Setup git config
@@ -69,14 +66,13 @@ jobs:
         with:
           ref: master
 
-      - name: Loading clang sysroot cache
+      - name: Loading ${{ matrix.bit }} toolchain cache
         uses: actions/cache/restore@main
         with:
-          path: |
-            clang_root
-          key: ${{ secrets.CACHE_VERSION }}-clang_root-${{ github.run_id }}
+          path: build_${{ matrix.bit }}
+          key: ${{ secrets.CACHE_VERSION }}-gcc-${{ matrix.bit }}_toolchain-${{ github.run_id }}
           restore-keys: |
-            ${{ secrets.CACHE_VERSION }}-clang_root
+            ${{ secrets.CACHE_VERSION }}-gcc-${{ matrix.bit }}_toolchain
 
       - name: Loading repository cache
         uses: actions/cache/restore@main
@@ -86,24 +82,28 @@ jobs:
           restore-keys: |
             ${{ secrets.CACHE_VERSION }}-repository
 
-      - name: Loading ${{ matrix.bit }} toolchain cache
+      - name: Loading rustup cache
         uses: actions/cache/restore@main
         with:
           path: |
-            build_${{ matrix.bit }}
-          key: ${{ secrets.CACHE_VERSION }}-clang-${{ matrix.bit }}_toolchain-${{ github.run_id }}
+            clang_root
+          key: ${{ secrets.CACHE_VERSION }}-clang_root-${{ github.run_id }}
           restore-keys: |
-            ${{ secrets.CACHE_VERSION }}-clang-${{ matrix.bit }}_toolchain
+            ${{ secrets.CACHE_VERSION }}-clang_root
 
       - name: Running custom command
         if: ${{ github.event.inputs.command != '' }}
         continue-on-error: true
         run: ${{ github.event.inputs.command }}
 
-      - name: Configuring CMake & Downloading source
+      - name: Downloading source
         run: |
-          cmake -DTARGET_ARCH=${{ env.arch }}-w64-mingw32 -DCOMPILER_TOOLCHAIN=clang ${{ env.x86_64_v3_ARCH }} -DCMAKE_INSTALL_PREFIX=$PWD/clang_root -DMINGW_INSTALL_PREFIX=$PWD/build_$BIT/$BIT-w64-mingw32 -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -DENABLE_CCACHE=ON -DCLANG_PACKAGES_LTO=ON -G Ninja --fresh -B build_$BIT -S $PWD
+          cmake -DTARGET_ARCH=${{ env.arch }}-w64-mingw32 ${{ env.gcc_arch }} -DSINGLE_SOURCE_LOCATION=$PWD/src_packages -DRUSTUP_LOCATION=$PWD/clang_root/install_rustup -DENABLE_CCACHE=ON --fresh -G Ninja -B build_$BIT -S $PWD
           ninja -C build_$BIT download || true
+
+      - name: Building toolchain
+        run: |
+          if [[ ! -f "build_$BIT/install/bin/cross-gcc" ]]; then ninja -C build_$BIT gcc && rm -rf build_$BIT/toolchain; fi
 
       - name: Building mpv
         id: build_mpv_step
@@ -117,12 +117,12 @@ jobs:
       - name: Packaging mpv
         run: |
           mkdir -p release_$BIT
-          ninja -C build_$BIT mpv-packaging; mv build_$BIT/mpv*.7z release_$BIT
+          rm -rf build_$BIT/mpv-debug*; ninja -C build_$BIT mpv-packaging; mv build_$BIT/mpv*.7z release_$BIT
 
       - name: Copying ffmpeg
         run: |
           hash=$(git -C src_packages/ffmpeg rev-parse --short HEAD)
-          7z a -m0=lzma2 -mx=9 -ms=on release_$BIT/ffmpeg-${{ env.arch }}${{ env.x86_64_level }}-git-$hash.7z ./build_$BIT/$BIT-w64-mingw32/bin/ffmpeg.exe
+          7z a -m0=lzma2 -mx=9 -ms=on release_$BIT/ffmpeg-${{ env.arch }}${{ env.x86_64_level }}-git-$hash.7z ./build_$BIT/install/mingw/bin/ffmpeg.exe
 
       - name: Collecting logs
         if: always()
@@ -145,63 +145,46 @@ jobs:
           name: mpv-${{ matrix.bit }}
           path: release_${{ matrix.bit }}/mpv-${{ env.arch }}*
 
-      - name: Uploading ${{ matrix.bit }} debug
-        uses: actions/upload-artifact@master
-        with:
-          name: mpv-${{ matrix.bit }}-debug
-          path: release_${{ matrix.bit }}/mpv-debug-${{ env.arch }}*
-
       - name: Cleaning build directory
         if: always()
         run: |
           rm -rf build_$BIT/mpv*
-          rm -rf release_$BIT/mpv-debug*.7z
 
       - name: Cleaning rust toolchain directory
         if: always()
         run: |
           ninja -C build_$BIT cargo-clean
 
-      - name: Saving clang sysroot cache
-        uses: actions/cache/save@main
-        if: ${{ always() && matrix.bit == 'x86_64' }}
-        with:
-          path: |
-            clang_root
-          key: ${{ secrets.CACHE_VERSION }}-clang_root-${{ github.run_id }}
-
-      - name: Saving repository cache
-        uses: actions/cache/save@main
-        if: ${{ always() && matrix.bit == 'x86_64' }}
-        with:
-          path: src_packages
-          key: ${{ secrets.CACHE_VERSION }}-repository-${{ github.run_id }}
-
       - name: Saving ${{ matrix.bit }} toolchain cache
         uses: actions/cache/save@main
         if: always()
         with:
-          path: |
-            build_${{ matrix.bit }}
-          key: ${{ secrets.CACHE_VERSION }}-clang-${{ matrix.bit }}_toolchain-${{ github.run_id }}
+          path: build_${{ matrix.bit }}
+          key: ${{ secrets.CACHE_VERSION }}-gcc-${{ matrix.bit }}_toolchain-${{ github.run_id }}
+
+      - name: Saving repository cache
+        uses: actions/cache/save@main
+        if: false
+        with:
+          path: src_packages
+          key: ${{ secrets.CACHE_VERSION }}-repository-${{ github.run_id }}
 
       - name: Saving release_${{ matrix.bit }} cache
         uses: actions/cache/save@main
+        if: ${{ github.event.inputs.github_release == 'true' }}
         with:
           path: release_${{ matrix.bit }}
-          key: ${{ secrets.CACHE_VERSION }}-release_${{ matrix.bit }}-${{ github.run_id }}
+          key: ${{ secrets.CACHE_VERSION }}-gcc-release_${{ matrix.bit }}-${{ github.run_id }}
 
   release:
     name: Upload releases
     runs-on: ubuntu-latest
     needs: build_mpv
+    if: ${{ github.event.inputs.github_release == 'true' }}
     env:
       GH_TOKEN: ${{ github.token }}
       CURL_RETRIES: "--connect-timeout 60 --retry 999 --retry-delay 5 --retry-all-errors"
-      release_i686_key: ${{ secrets.CACHE_VERSION }}-release_i686-${{ github.run_id }}
-      release_x86_64_key: ${{ secrets.CACHE_VERSION }}-release_x86_64-${{ github.run_id }}
-      release_x86_64_v3_key: ${{ secrets.CACHE_VERSION }}-release_x86_64_v3-${{ github.run_id }}
-      release_aarch64_key: ${{ secrets.CACHE_VERSION }}-release_aarch64-${{ github.run_id }}
+      release_x86_64_key: ${{ secrets.CACHE_VERSION }}-gcc-release_x86_64-${{ github.run_id }}
     container:
       image: docker://alpine:latest
 
@@ -210,6 +193,7 @@ jobs:
         shell: sh
         run: |
           apk add --update --no-cache bash git file openssh curl tar zstd jq
+          apk add perl-file-rename --repository=https://dl-cdn.alpinelinux.org/alpine/edge/testing
           git config --global pull.rebase true
           git config --global fetch.prune true
           git config --global --add safe.directory $PWD
@@ -218,39 +202,23 @@ jobs:
         with:
           ref: master
 
-      - name: Loading release_i686 cache
-        uses: actions/cache/restore@main
-        with:
-          path: release_i686
-          key: ${{ env.release_i686_key }}
-
       - name: Loading release_x86_64 cache
         uses: actions/cache/restore@main
         with:
           path: release_x86_64
           key: ${{ env.release_x86_64_key }}
 
-      - name: Loading release_x86_64_v3 cache
-        uses: actions/cache/restore@main
-        with:
-          path: release_x86_64_v3
-          key: ${{ env.release_x86_64_v3_key }}
-
-      - name: Loading release_aarch64 cache
-        uses: actions/cache/restore@main
-        with:
-          path: release_aarch64
-          key: ${{ env.release_aarch64_key }}
-
       - name: Moving archives
         run: |
           mkdir -p release
-          mv release_i686/* release_x86_64/* release_x86_64_v3/* release_aarch64/* release
+          mv release_x86_64/* release
+          rm release/ffmpeg*.7z
+          file-rename 's/mpv-(.*)x86_64-(.+)/mpv-${1}x86_64-gcc-${2}/s' $PWD/release/mpv*.7z
           du -ah release/*
 
       - name: Uploading packages to Sourceforge
         id: upload_packages_sf
-        if: ${{ github.event.inputs.sourceforge == 'true' }}
+        if: false
         continue-on-error: true
         env:
           MPV_VER: ${{ needs.build_mpv.outputs.mpv_ver }}
@@ -277,25 +245,11 @@ jobs:
         if: ${{ github.event.inputs.github_release == 'true' && github.event.inputs.mpv_tarball == 'false' }}
         continue-on-error: true
         run: |
-          short_date=$(date "+%Y%m%d")
-          body=$(cat <<END
-          ![GitHub release (by tag)](https://img.shields.io/github/downloads/shinchiro/mpv-winbuild-cmake/$short_date/total?label=Downloads)
-
-          **Workflow run**: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-          END
-          )
-          id=$(curl -u shinchiro:$GH_TOKEN $CURL_RETRIES -s -X POST -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases -d @- <<END | jq -r '.id'
-          {
-            "tag_name": "$short_date",
-            "name": "$short_date",
-            "body": "$(echo ${body//$'\n'/'\n'})"
-          }
-          END
-          )
+          id=$(curl -u shinchiro:$GH_TOKEN $CURL_RETRIES -s -X GET -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest | jq -r '.id')
           for file in release/*.7z; do curl -u shinchiro:$GH_TOKEN $CURL_RETRIES -X POST -H "Accept: application/vnd.github.v3+json" -H "Content-Type: $(file -b --mime-type $file)" https://uploads.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/$id/assets?name=$(basename $file) --data-binary @$file; done
 
       - name: Pruning tags
-        continue-on-error: true
+        if: false
         run: |
           # Keep latest 30 tags/releases
           git fetch --tags
@@ -311,38 +265,13 @@ jobs:
       - name: Delete releases cache
         if: ${{ github.event.inputs.github_release == 'false' || steps.upload_packages_gh.outcome == 'success' }}
         run: |
-          curl -u shinchiro:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/actions/caches?key=$release_i686_key
           curl -u shinchiro:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/actions/caches?key=$release_x86_64_key
-          curl -u shinchiro:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/actions/caches?key=$release_x86_64_v3_key
-          curl -u shinchiro:$GH_TOKEN $CURL_RETRIES -s -o /dev/null -X DELETE -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/actions/caches?key=$release_aarch64_key
-
-  call_workflow:
-    name: Run mpv_gcc
-    runs-on: ubuntu-latest
-    needs: build_mpv
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_COMMAND: ${{ github.event.inputs.command }}
-    steps:
-      - name: Run mpv_gcc.yml
-        run: |
-          curl -u shinchiro:$GH_TOKEN -X POST -H "Accept: application/vnd.github.v3+json" https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/actions/workflows/mpv_gcc.yml/dispatches -d @- <<EOF
-          {
-            "ref": "master",
-            "inputs": {
-              "sourceforge": "false",
-              "github_release": "true",
-              "mpv_tarball": "false",
-              "command": "$GH_COMMAND"
-            }
-          }
-          EOF
 
   gist:
     name: Gist
     runs-on: ubuntu-latest
     needs: build_mpv
-    if: ${{ always() }}
+    if: false
     env:
       GH_TOKEN: ${{ secrets.GIST_TOKEN }}
       RUN_ID: ${{ github.run_id }}
